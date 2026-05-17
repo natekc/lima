@@ -1,0 +1,70 @@
+# A template to import USB devices from a USB/IP server on the host.
+#
+# Works with any USB/IP server that speaks the in-kernel USB/IP wire
+# protocol on TCP/3240. Native hypervisor-level USB passthrough on
+# macOS is tracked separately in lima-vm/lima#4766.
+#
+# Prerequisites on the host:
+#   1. A USB/IP server is listening (default `host.lima.internal:3240`).
+#   2. The devices you want to import are bound / captured by that
+#      server (each server has its own command for this).
+#
+# Prerequisite in the guest:
+#   * The `usbip` userspace tool must be installed. We install it via
+#     `provision:` below rather than at boot to keep boot deterministic
+#     and avoid surprise network installs on every cold start.
+#
+# At boot the cidata `45-setup-usbip.sh` script loads `vhci_hcd`,
+# then a guestagent reconciler polls the USB/IP server every few
+# seconds and runs `usbip attach`/`usbip detach` to converge.
+# Errors (server unreachable, configured device not exported) are
+# logged at warn level and throttled to one line per minute, so a
+# misconfigured server does not flood the journal.
+
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-lts
+- template:_default/mounts
+
+provision:
+- mode: system
+  script: |
+    #!/bin/sh
+    set -eu
+    if ! command -v usbip >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends usbip
+    fi
+
+usb:
+  # USB/IP-based passthrough (network transport). Sibling sub-blocks
+  # under `usb:` are reserved for future hypervisor-level USB
+  # passthrough (see lima-vm/lima#4766).
+  ip:
+    # Default USB/IP server (host[:port]). Optional; this is the default
+    # value applied when no server is specified.
+    server: host.lima.internal:3240
+    devices:
+    # --- Static busid mode ---
+    # Replace `1-2` with the busid reported by your USB/IP server
+    # (consult its documentation for the listing command).
+    - busid: 1-2
+
+    # --- Auto-attach by VID:PID (hotplug) ---
+    # When vendorID + productID are set instead of `busid`, the
+    # guestagent polls the USB/IP server every few seconds and
+    # attaches the device whenever it appears on the server
+    # (including after unplug/replug). Works with any USB/IP server
+    # that speaks the kernel protocol -- no event socket required.
+    # - vendorID: "1050"     # 4-digit lowercase hex
+    #   productID: "0407"
+
+    # Per-device server overrides are allowed in either mode:
+    # - busid: 4-1
+    #   server: some-other-host:3240
+
+# After `limactl start`, verify with:
+#   limactl shell default -- lsusb
+#   limactl shell default -- sudo dmesg | tail

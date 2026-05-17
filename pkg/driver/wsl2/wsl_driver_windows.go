@@ -43,6 +43,7 @@ var knownYamlProperties = []string{
 	"PropagateProxyEnv",
 	"Provision",
 	"SSH",
+	"USB",
 	"VMType",
 }
 

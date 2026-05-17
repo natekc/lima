@@ -572,6 +572,40 @@ func FillDefault(ctx context.Context, y, d, o *limatype.LimaYAML, filePath strin
 		// After defaults processing the singular HostPort and GuestPort values should not be used again.
 	}
 
+	// USB/IP: devices from o, y, d are concatenated (same convention as
+	// PortForwards / CopyToHost — no key-based merge). Cross-layer
+	// duplicates are caught explicitly by Validate. Per-device server
+	// falls back to the top-level server, which itself defaults to
+	// host.lima.internal:3240 only when at least one device is configured
+	// (to keep the saved yaml clean for instances that do not use USB/IP).
+	y.USB.IP.Devices = slices.Concat(o.USB.IP.Devices, y.USB.IP.Devices, d.USB.IP.Devices)
+	if y.USB.IP.Server == nil {
+		y.USB.IP.Server = d.USB.IP.Server
+	}
+	if o.USB.IP.Server != nil {
+		y.USB.IP.Server = o.USB.IP.Server
+	}
+	if y.USB.IP.Server == nil && len(y.USB.IP.Devices) > 0 {
+		y.USB.IP.Server = ptr.Of("host.lima.internal:3240")
+	}
+	for i := range y.USB.IP.Devices {
+		if y.USB.IP.Devices[i].Server == nil && y.USB.IP.Server != nil {
+			// Copy the value rather than aliasing the pointer so later
+			// per-device mutation can't reach back into the top-level field.
+			y.USB.IP.Devices[i].Server = ptr.Of(*y.USB.IP.Server)
+		}
+		// Hex VID/PID is canonicalised to lowercase here so users can
+		// paste `lsusb` output verbatim. The validator only accepts
+		// lowercase, so this also turns an otherwise-terse "must be 4
+		// lowercase hex digits" error into a no-op for valid input.
+		if v := y.USB.IP.Devices[i].VendorID; v != nil {
+			y.USB.IP.Devices[i].VendorID = ptr.Of(strings.ToLower(*v))
+		}
+		if p := y.USB.IP.Devices[i].ProductID; p != nil {
+			y.USB.IP.Devices[i].ProductID = ptr.Of(strings.ToLower(*p))
+		}
+	}
+
 	y.CopyToHost = slices.Concat(o.CopyToHost, y.CopyToHost, d.CopyToHost)
 	for i := range y.CopyToHost {
 		FillCopyToHostDefaults(&y.CopyToHost[i], instDir, y.User, y.Param)

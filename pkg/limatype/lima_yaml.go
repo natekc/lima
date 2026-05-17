@@ -58,6 +58,66 @@ type LimaYAML struct {
 	TimeZone             *string `yaml:"timezone,omitempty" json:"timezone,omitempty" jsonschema:"nullable"`
 	NestedVirtualization *bool   `yaml:"nestedVirtualization,omitempty" json:"nestedVirtualization,omitempty" jsonschema:"nullable"`
 	User                 User    `yaml:"user,omitempty" json:"user,omitempty"`
+	USB                  USB     `yaml:"usb,omitempty" json:"usb,omitempty"`
+}
+
+// USB groups USB-related configuration. The `ip` sub-block configures
+// the network-based USB/IP transport, served by any host-side
+// implementation that speaks the kernel USB/IP wire protocol on TCP.
+//
+// Additional sub-blocks for hypervisor-level USB passthrough (such as
+// QEMU `-device usb-host` driven via QMP, tracked in lima-vm/lima#4766)
+// are intentionally reserved at this level so they can be added later
+// without a second top-level YAML key.
+type USB struct {
+	// IP configures USB/IP-based passthrough (network transport).
+	IP USBIP `yaml:"ip,omitempty" json:"ip,omitempty"`
+}
+
+// USBIP describes USB devices to be imported from a USB/IP server.
+//
+// On Linux guests, devices listed here are attached after boot via
+// `usbip attach`, requiring the kernel's `vhci_hcd` module and the
+// `usbip` userspace utility (installed automatically).
+type USBIP struct {
+	// Server is the default USB/IP server in `host[:port]` form.
+	// Defaults to `host.lima.internal:3240`, which works out of the box
+	// when a USB/IP server is listening on the macOS / Windows / Linux
+	// host. Individual devices may override this via their own `server`.
+	Server *string `yaml:"server,omitempty" json:"server,omitempty" jsonschema:"nullable"`
+	// Devices is the list of USB devices to import on guest boot.
+	Devices []USBIPDevice `yaml:"devices,omitempty" json:"devices,omitempty"`
+}
+
+// USBIPDevice identifies a single USB device on a USB/IP server.
+//
+// A device may be identified two ways:
+//
+//   - By BusID: a static reference to a specific port on the server
+//     (e.g. `1-2`). Use this when the device is reliably plugged into
+//     the same port.
+//   - By VendorID + ProductID: a content-addressed match. The
+//     guestagent polls the server's device list and attaches/detaches
+//     matching devices as they appear/disappear, so hotplug (and
+//     unplug/replug across reboots) works without restarting the VM.
+//
+// Exactly one of {BusID} or {VendorID + ProductID} must be set. If
+// both are set, validation rejects the device — silently preferring
+// one would mask configuration mistakes.
+type USBIPDevice struct {
+	// BusID identifies the device on the server, in the form used by the
+	// `usbip` tool (e.g. `1-2`, `01-1.4`). Mutually exclusive with
+	// VendorID/ProductID.
+	BusID string `yaml:"busid,omitempty" json:"busid,omitempty"`
+	// VendorID is the 4-digit lowercase hex USB vendor id (e.g. `1050`).
+	// Required when matching by VID:PID; mutually exclusive with BusID.
+	VendorID *string `yaml:"vendorID,omitempty" json:"vendorID,omitempty" jsonschema:"nullable"`
+	// ProductID is the 4-digit lowercase hex USB product id (e.g. `0407`).
+	// Required when VendorID is set.
+	ProductID *string `yaml:"productID,omitempty" json:"productID,omitempty" jsonschema:"nullable"`
+	// Server optionally overrides the top-level `usb.ip.server` for this
+	// device, in `host[:port]` form.
+	Server *string `yaml:"server,omitempty" json:"server,omitempty" jsonschema:"nullable"`
 }
 
 type BaseTemplates []LocatorWithDigest

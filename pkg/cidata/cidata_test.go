@@ -60,3 +60,22 @@ func TestSetupInvalidEnv(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Equal(t, envs[envKey], envValue)
 }
+
+func TestSplitUSBIPServer(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantHost string
+		wantPort string
+	}{
+		{"example.com", "example.com", "3240"},
+		{"example.com:9999", "example.com", "9999"},
+		{"127.0.0.1:3240", "127.0.0.1", "3240"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			gotHost, gotPort := splitUSBIPServer(tc.in)
+			assert.Equal(t, gotHost, tc.wantHost)
+			assert.Equal(t, gotPort, tc.wantPort)
+		})
+	}
+}

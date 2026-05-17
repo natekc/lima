@@ -6,6 +6,7 @@ package cidata
 import (
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -355,7 +356,62 @@ func templateArgs(ctx context.Context, bootScripts bool, instDir, name string, i
 		}
 	}
 
+	// USB/IP devices: resolve server "host[:port]" defaults, then
+	// marshal the whole list as a single JSON env var. JSON keeps the
+	// wire format compact and rename-resistant: adding or renaming a
+	// field is a schema change visible at a single site (template.go),
+	// not a silent breakage scattered across LIMA_CIDATA_USBIP_DEVICES_N_*
+	// keys.
+	tmplDevs := make([]USBIPDevice, 0, len(instConfig.USB.IP.Devices))
+	for _, dev := range instConfig.USB.IP.Devices {
+		server := ""
+		if dev.Server != nil {
+			server = *dev.Server
+		}
+		host, port := splitUSBIPServer(server)
+		resolved := host
+		if port != "" {
+			resolved = net.JoinHostPort(host, port)
+		}
+		td := USBIPDevice{BusID: dev.BusID, Server: resolved}
+		if dev.VendorID != nil {
+			td.VendorID = *dev.VendorID
+		}
+		if dev.ProductID != nil {
+			td.ProductID = *dev.ProductID
+		}
+		tmplDevs = append(tmplDevs, td)
+	}
+	if len(tmplDevs) > 0 {
+		b, err := json.Marshal(tmplDevs)
+		if err != nil {
+			return nil, fmt.Errorf("marshal USBIP devices for cidata: %w", err)
+		}
+		// The env-file template wraps values in single quotes. The
+		// JSON we marshal here is safe inside single quotes only
+		// because the limayaml validators reject `'` in every field
+		// that ends up in this slice (server is DNS or IPv4, busid
+		// matches `\d+-\d+(\.\d+)*`, vendor/product are 4 hex digits).
+		// If a future field admits apostrophes it must escape them.
+		args.USBIPDevicesJSON = string(b)
+	}
+
 	return &args, nil
+}
+
+// splitUSBIPServer parses a USB/IP server address into (host, port).
+// Accepts bare host and "host:port". Port defaults to "3240" (the
+// IANA-assigned and de-facto USB/IP port).
+//
+// IPv6 literals and the empty string are rejected by validate.go
+// before reaching here, so they are not handled.
+func splitUSBIPServer(s string) (string, string) {
+	const defaultPort = "3240"
+	if host, port, err := net.SplitHostPort(s); err == nil {
+		return host, port
+	}
+	// Bare host with no port.
+	return s, defaultPort
 }
 
 func GenerateCloudConfig(ctx context.Context, instDir, name string, instConfig *limatype.LimaYAML) error {

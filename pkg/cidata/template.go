@@ -74,6 +74,22 @@ type Disk struct {
 	FSType string
 	FSArgs []string
 }
+
+// USBIPDevice represents a single USB device to import via USB/IP,
+// with the server address already resolved (defaults applied). At
+// least one of {BusID} or {VendorID + ProductID} is set (validated
+// upstream).
+//
+// The JSON tags are the on-wire schema: this struct is marshaled
+// into the LIMA_CIDATA_USBIP_DEVICES_JSON env var that the guestagent
+// reads back. Field renames are a breaking change for any guest
+// running an older agent against a newer host.
+type USBIPDevice struct {
+	BusID     string `json:"busid,omitempty"`
+	VendorID  string `json:"vendor_id,omitempty"`  // 4-digit lowercase hex; empty for busid-mode
+	ProductID string `json:"product_id,omitempty"` // 4-digit lowercase hex; empty for busid-mode
+	Server    string `json:"server"`               // host[:port], port defaulted upstream
+}
 type TemplateArgs struct {
 	Debug                           bool
 	OS                              limatype.OS
@@ -117,6 +133,7 @@ type TemplateArgs struct {
 	Plain                           bool
 	TimeZone                        string
 	NoCloudInit                     bool
+	USBIPDevicesJSON                string // marshaled []USBIPDevice; the on-wire form for the guestagent
 }
 
 func ValidateTemplateArgs(args *TemplateArgs) error {

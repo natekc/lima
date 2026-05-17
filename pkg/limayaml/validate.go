@@ -417,6 +417,18 @@ func Validate(y *limatype.LimaYAML, warn bool) error {
 		}
 	}
 
+	for i, dev := range y.USB.IP.Devices {
+		errs = errors.Join(errs, validateUSBIPDevice(i, &dev))
+	}
+	if y.USB.IP.Server != nil {
+		if err := validateUSBIPServer(*y.USB.IP.Server); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("field `usb.ip.server`: %w", err))
+		}
+	}
+	if len(y.USB.IP.Devices) > 0 && y.OS != nil && *y.OS != limatype.LINUX {
+		logrus.Warnf("usb.ip.devices is configured but the guest OS is %q; USB/IP auto-attach is only implemented for Linux guests, devices will be ignored", *y.OS)
+	}
+
 	return errs
 }
 
@@ -647,4 +659,102 @@ func ValidateAgainstLatestConfig(ctx context.Context, yNew, yLatest []byte) erro
 	}
 
 	return errs
+}
+
+// validateUSBIPDevice validates a single `usb.ip.devices[i]` entry.
+// Exactly one identification mode must be in use:
+//
+//   - BusID-only (`busid: "1-2"`): static port reference.
+//   - VID+PID (+ optional Serial): content-addressed match used by the
+//     hostagent's auto-attach watcher.
+//
+// Setting both is rejected as a configuration error rather than
+// silently preferring one — the two modes have very different runtime
+// semantics (static vs. hotplug) and a config that means both is
+// almost certainly a mistake.
+func validateUSBIPDevice(i int, dev *limatype.USBIPDevice) error {
+	var errs error
+	hasBusID := strings.TrimSpace(dev.BusID) != ""
+	hasVID := dev.VendorID != nil && strings.TrimSpace(*dev.VendorID) != ""
+	hasPID := dev.ProductID != nil && strings.TrimSpace(*dev.ProductID) != ""
+
+	switch {
+	case !hasBusID && !hasVID && !hasPID:
+		errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d]`: must set either `busid` or both `vendorID` and `productID`", i))
+	case hasBusID && (hasVID || hasPID):
+		errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d]`: `busid` is mutually exclusive with `vendorID`/`productID`", i))
+	case !hasBusID && hasVID != hasPID:
+		errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d]`: `vendorID` and `productID` must be set together", i))
+	}
+
+	if hasBusID && !usbipBusIDRe.MatchString(dev.BusID) {
+		// Reject anything outside [A-Za-z0-9.-] to catch typos and to
+		// stop shell injection through the boot-script env file.
+		errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d].busid` contains invalid character (allowed: alphanumeric, '-', '.'): %q", i, dev.BusID))
+	}
+
+	if hasVID {
+		if err := validateUSBHex4("vendorID", *dev.VendorID); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d].vendorID`: %w", i, err))
+		}
+	}
+	if hasPID {
+		if err := validateUSBHex4("productID", *dev.ProductID); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d].productID`: %w", i, err))
+		}
+	}
+	if dev.Server != nil {
+		if err := validateUSBIPServer(*dev.Server); err != nil {
+			errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d].server`: %w", i, err))
+		}
+	}
+	return errs
+}
+
+// USB/IP validation helpers. Each regex is anchored so it matches the
+// whole input. The hostname regex is stricter than RFC 1123: it
+// rejects leading/trailing hyphens per label so the value can be
+// re-emitted into a shell-sourced env file without further escaping.
+var (
+	usbHex4Re    = regexp.MustCompile(`^[0-9a-f]{4}$`)
+	usbipBusIDRe = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
+	usbipHostRe  = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$`)
+)
+
+func validateUSBHex4(field, s string) error {
+	if !usbHex4Re.MatchString(s) {
+		return fmt.Errorf("%s %q: must be 4 lowercase hex digits", field, s)
+	}
+	return nil
+}
+
+// validateUSBIPServer accepts "host" or "host:port". Host is a DNS
+// label or dotted IPv4. IPv6 is rejected because most usbip(8) builds
+// cannot parse a bare IPv6 in -r, and end-to-end IPv6 has not been
+// exercised. The strict allow-list also closes the boot-script shell
+// injection path through the cidata env file.
+func validateUSBIPServer(s string) error {
+	if strings.TrimSpace(s) == "" {
+		return errors.New("must not be empty when set")
+	}
+	if strings.ContainsAny(s, "[]") {
+		return fmt.Errorf("IPv6 server addresses are not supported: %q", s)
+	}
+	host := s
+	if h, p, err := net.SplitHostPort(s); err == nil {
+		host = h
+		n, err := strconv.Atoi(p)
+		if err != nil || n < 1 || n > 65535 {
+			return fmt.Errorf("invalid port %q in %q (must be 1..65535)", p, s)
+		}
+	} else if strings.ContainsRune(s, ':') {
+		return fmt.Errorf("invalid host:port %q: %w", s, err)
+	}
+	if host == "" {
+		return fmt.Errorf("missing host in %q", s)
+	}
+	if net.ParseIP(host) == nil && !usbipHostRe.MatchString(host) {
+		return fmt.Errorf("invalid host %q (allowed: DNS labels and dotted IPv4)", host)
+	}
+	return nil
 }

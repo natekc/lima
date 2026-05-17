@@ -10,6 +10,7 @@ import (
 	"gotest.tools/v3/assert"
 
 	"github.com/lima-vm/lima/v2/pkg/limatype"
+	"github.com/lima-vm/lima/v2/pkg/ptr"
 	"github.com/lima-vm/lima/v2/pkg/version"
 )
 
@@ -428,4 +429,197 @@ func TestValidateAgainstLatestConfig(t *testing.T) {
 			assert.Error(t, err, tt.wantErr)
 		})
 	}
+}
+
+func TestValidateUSBIPServer(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"", true},
+		{" ", true},
+		{"example.com", false},
+		{"example.com:3240", false},
+		{"127.0.0.1:3240", false},
+		{"host:", true},                // empty port
+		{":3240", true},                // empty host
+		{"host:abcd", true},            // non-numeric port
+		{"host:0", true},               // port out of range (low)
+		{"host:65536", true},           // port out of range (high)
+		{"evil;rm:3240", true},         // shell metachar in host
+		{"host with space:3240", true}, // whitespace in host
+		{"$(touch /tmp/x)", true},      // command substitution
+		{"-bad.example:3240", true},    // leading hyphen
+		{"bad-.example:3240", true},    // trailing hyphen in label boundary
+		{"[::1]", true},                // IPv6 not supported
+		{"[::1]:3240", true},           // IPv6 not supported
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			err := validateUSBIPServer(tc.in)
+			if tc.wantErr {
+				assert.Assert(t, err != nil, "expected error for %q", tc.in)
+			} else {
+				assert.NilError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateUSBIPDevices(t *testing.T) {
+	images := `images: [{"location": "/"}]`
+	cases := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name:    "ok minimal busid",
+			yaml:    images + "\nusb: {ip: {devices: [{busid: '1-2'}]}}\n",
+			wantErr: "",
+		},
+		{
+			name:    "ok dotted busid",
+			yaml:    images + "\nusb: {ip: {devices: [{busid: '01-1.4'}]}}\n",
+			wantErr: "",
+		},
+		{
+			name:    "ok vid pid",
+			yaml:    images + "\nusb: {ip: {devices: [{vendorID: '1050', productID: '0407'}]}}\n",
+			wantErr: "",
+		},
+		{
+			name:    "neither busid nor vid",
+			yaml:    images + "\nusb: {ip: {devices: [{}]}}\n",
+			wantErr: "must set either `busid` or both `vendorID` and `productID`",
+		},
+		{
+			name:    "busid and vid mutually exclusive",
+			yaml:    images + "\nusb: {ip: {devices: [{busid: '1-2', vendorID: '1050', productID: '0407'}]}}\n",
+			wantErr: "mutually exclusive",
+		},
+		{
+			name:    "vid without pid",
+			yaml:    images + "\nusb: {ip: {devices: [{vendorID: '1050'}]}}\n",
+			wantErr: "must be set together",
+		},
+		{
+			name:    "pid without vid",
+			yaml:    images + "\nusb: {ip: {devices: [{productID: '0407'}]}}\n",
+			wantErr: "must be set together",
+		},
+		{
+			name:    "vid uppercase is canonicalised to lowercase",
+			yaml:    images + "\nusb: {ip: {devices: [{vendorID: '1050', productID: '04FF'}]}}\n",
+			wantErr: "",
+		},
+		{
+			name:    "vid wrong length",
+			yaml:    images + "\nusb: {ip: {devices: [{vendorID: '105', productID: '0407'}]}}\n",
+			wantErr: "must be 4 lowercase hex digits",
+		},
+		{
+			name:    "shell metachar busid",
+			yaml:    images + "\nusb: {ip: {devices: [{busid: '1-2;rm'}]}}\n",
+			wantErr: "invalid character",
+		},
+		{
+			name:    "bad server",
+			yaml:    images + "\nusb: {ip: {server: 'host:'}}\n",
+			wantErr: "usb.ip.server",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			y, err := Load(t.Context(), []byte(tc.yaml), "usbip.yaml")
+			assert.NilError(t, err)
+			err = Validate(y, false)
+			if tc.wantErr == "" {
+				assert.NilError(t, err)
+			} else {
+				assert.ErrorContains(t, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestFillDefaultUSBIP(t *testing.T) {
+	t.Run("default server only materialized when devices configured", func(t *testing.T) {
+		y, err := Load(t.Context(), []byte("images: [{location: '/'}]\n"), "none.yaml")
+		assert.NilError(t, err)
+		assert.Assert(t, y.USB.IP.Server == nil, "expected no default server when no devices are configured")
+		assert.Equal(t, len(y.USB.IP.Devices), 0)
+	})
+
+	t.Run("top-level default populates and per-device inherits or overrides", func(t *testing.T) {
+		y, err := Load(t.Context(), []byte("images: [{location: '/'}]\nusb: {ip: {devices: [{busid: '1-2'}, {busid: '4-1', server: 'other:9999'}]}}\n"), "usbip.yaml")
+		assert.NilError(t, err)
+		assert.Equal(t, len(y.USB.IP.Devices), 2)
+		assert.Assert(t, y.USB.IP.Server != nil)
+		assert.Equal(t, *y.USB.IP.Server, "host.lima.internal:3240")
+		assert.Assert(t, y.USB.IP.Devices[0].Server != nil)
+		assert.Equal(t, *y.USB.IP.Devices[0].Server, "host.lima.internal:3240")
+		assert.Assert(t, y.USB.IP.Devices[1].Server != nil)
+		assert.Equal(t, *y.USB.IP.Devices[1].Server, "other:9999")
+	})
+
+	t.Run("server pointer is copied not aliased", func(t *testing.T) {
+		// Mutating the top-level Server after FillDefault must not affect
+		// per-device Server pointers (regression guard for pointer aliasing).
+		y, err := Load(t.Context(), []byte("images: [{location: '/'}]\nusb: {ip: {devices: [{busid: '1-2'}]}}\n"), "usbip.yaml")
+		assert.NilError(t, err)
+		*y.USB.IP.Server = "mutated"
+		assert.Equal(t, *y.USB.IP.Devices[0].Server, "host.lima.internal:3240")
+	})
+
+	t.Run("hex VID/PID is canonicalised to lowercase", func(t *testing.T) {
+		// Users often paste uppercase hex from `lsusb` output; the
+		// validator only accepts lowercase, so FillDefault canonicalises
+		// to keep the UX friendly.
+		y, err := Load(t.Context(), []byte("images: [{location: '/'}]\nusb: {ip: {devices: [{vendorID: '1050', productID: '04FF'}]}}\n"), "usbip.yaml")
+		assert.NilError(t, err)
+		assert.Equal(t, len(y.USB.IP.Devices), 1)
+		assert.Assert(t, y.USB.IP.Devices[0].VendorID != nil)
+		assert.Assert(t, y.USB.IP.Devices[0].ProductID != nil)
+		assert.Equal(t, *y.USB.IP.Devices[0].VendorID, "1050")
+		assert.Equal(t, *y.USB.IP.Devices[0].ProductID, "04ff")
+	})
+
+	t.Run("FillDefault inheritance order: o overrides y overrides d", func(t *testing.T) {
+		// Build y with a default-fillable server, then call FillDefault with d/o
+		// layers directly to exercise the three-way merge.
+		y := &limatype.LimaYAML{
+			Images: []limatype.Image{{File: limatype.File{Location: "/"}}},
+			USB: limatype.USB{IP: limatype.USBIP{
+				Devices: []limatype.USBIPDevice{{BusID: "1-2"}},
+			}},
+		}
+		d := &limatype.LimaYAML{USB: limatype.USB{IP: limatype.USBIP{Server: ptr.Of("from-default:1111")}}}
+		o := &limatype.LimaYAML{USB: limatype.USB{IP: limatype.USBIP{Server: ptr.Of("from-override:2222")}}}
+		FillDefault(t.Context(), y, d, o, "merge.yaml", false)
+		assert.Assert(t, y.USB.IP.Server != nil)
+		assert.Equal(t, *y.USB.IP.Server, "from-override:2222")
+		assert.Equal(t, *y.USB.IP.Devices[0].Server, "from-override:2222")
+	})
+
+	t.Run("override devices are concatenated and inherit override server", func(t *testing.T) {
+		y := &limatype.LimaYAML{
+			Images: []limatype.Image{{File: limatype.File{Location: "/"}}},
+			USB: limatype.USB{IP: limatype.USBIP{
+				Devices: []limatype.USBIPDevice{{BusID: "2-1"}},
+			}},
+		}
+		d := &limatype.LimaYAML{}
+		o := &limatype.LimaYAML{USB: limatype.USB{IP: limatype.USBIP{
+			Server:  ptr.Of("override:1234"),
+			Devices: []limatype.USBIPDevice{{BusID: "3-1"}},
+		}}}
+		FillDefault(t.Context(), y, d, o, "merge.yaml", false)
+		assert.Equal(t, len(y.USB.IP.Devices), 2)
+		// Override devices come first (slices.Concat(o, y, d)).
+		assert.Equal(t, y.USB.IP.Devices[0].BusID, "3-1")
+		assert.Equal(t, y.USB.IP.Devices[1].BusID, "2-1")
+		assert.Equal(t, *y.USB.IP.Devices[0].Server, "override:1234")
+		assert.Equal(t, *y.USB.IP.Devices[1].Server, "override:1234")
+	})
 }

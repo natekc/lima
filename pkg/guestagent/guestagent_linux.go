@@ -18,6 +18,7 @@ import (
 	"github.com/lima-vm/lima/v2/pkg/guestagent/kubernetesservice"
 	"github.com/lima-vm/lima/v2/pkg/guestagent/sockets"
 	"github.com/lima-vm/lima/v2/pkg/guestagent/ticker"
+	"github.com/lima-vm/lima/v2/pkg/guestagent/usbip"
 )
 
 func New(ctx context.Context, ticker ticker.Ticker, runtimeDir string) (Agent, error) {
@@ -33,6 +34,7 @@ func New(ctx context.Context, ticker ticker.Ticker, runtimeDir string) (Agent, e
 	}
 
 	go a.kubernetesServiceWatcher.Start(ctx)
+	startUSBIPReconciler(ctx, &usbip.Shell{}, loadUSBIPDevices)
 
 	go func() {
 		<-ctx.Done()
