@@ -5,8 +5,10 @@ package limayaml
 
 import (
 	"fmt"
+	"os"
 	"testing"
 
+	"github.com/goccy/go-yaml"
 	"gotest.tools/v3/assert"
 
 	"github.com/lima-vm/lima/v2/pkg/limatype"
@@ -521,12 +523,55 @@ func TestValidateUSBIPDevices(t *testing.T) {
 		{
 			name:    "shell metachar busid",
 			yaml:    images + "\nusb: {ip: {devices: [{busid: '1-2;rm'}]}}\n",
-			wantErr: "invalid character",
+			wantErr: "is not a valid Linux bus-id",
 		},
 		{
 			name:    "bad server",
 			yaml:    images + "\nusb: {ip: {server: 'host:'}}\n",
 			wantErr: "usb.ip.server",
+		},
+		{
+			name:    "duplicate busid same server",
+			yaml:    images + "\nusb: {ip: {devices: [{busid: '1-2'}, {busid: '1-2'}]}}\n",
+			wantErr: "duplicate of `usb.ip.devices[0]`",
+		},
+		{
+			name:    "duplicate vid/pid same server",
+			yaml:    images + "\nusb: {ip: {devices: [{vendorID: '1050', productID: '0407'}, {vendorID: '1050', productID: '0407'}]}}\n",
+			wantErr: "duplicate of `usb.ip.devices[0]`",
+		},
+		{
+			name:    "same busid on different servers is fine",
+			yaml:    images + "\nusb: {ip: {devices: [{busid: '1-2', server: 'a:3240'}, {busid: '1-2', server: 'b:3240'}]}}\n",
+			wantErr: "",
+		},
+		{
+			// `host` vs `host:3240` are the same endpoint after
+			// FillDefault; the duplicate-check key normalises so
+			// they collapse to one entry.
+			name:    "duplicate via default-port-equivalent server",
+			yaml:    images + "\nusb: {ip: {server: 'host.lima.internal', devices: [{busid: '1-2'}, {busid: '1-2', server: 'host.lima.internal:3240'}]}}\n",
+			wantErr: "duplicate of `usb.ip.devices[0]`",
+		},
+		{
+			// An explicitly-empty devices list with no server is a
+			// no-op and must validate cleanly. Pins behaviour against
+			// a future refactor turning this into an error.
+			name:    "empty devices list is a no-op",
+			yaml:    images + "\nusb: {ip: {devices: []}}\n",
+			wantErr: "",
+		},
+		{
+			name:    "non-linux guest rejects usb.ip.devices",
+			yaml:    images + "\nos: 'Windows'\nusb: {ip: {devices: [{busid: '1-2'}]}}\n",
+			wantErr: "only supported for Linux guests",
+		},
+		{
+			// S4: server-only usb.ip block on non-Linux is inert
+			// and must be rejected at validate time.
+			name:    "non-linux guest rejects server-only usb.ip",
+			yaml:    images + "\nos: 'Windows'\nusb: {ip: {server: 'host.lima.internal:3240'}}\n",
+			wantErr: "only supported for Linux guests",
 		},
 	}
 	for _, tc := range cases {
@@ -622,4 +667,25 @@ func TestFillDefaultUSBIP(t *testing.T) {
 		assert.Equal(t, *y.USB.IP.Devices[0].Server, "override:1234")
 		assert.Equal(t, *y.USB.IP.Devices[1].Server, "override:1234")
 	})
+}
+
+// TestValidateExperimentalUSBIPTemplate is a schema-sanity smoke for the
+// experimental template. CI does not exercise templates/experimental/ in
+// hack/test-templates.sh, so without this test a breaking change to the
+// `usb.ip` shape could land without the shipped template noticing.
+//
+// It only asserts the YAML unmarshals into LimaYAML and that the usb.ip
+// block survives parsing; full Validate would require resolving `base:`
+// (network) and is out of scope for a unit test.
+func TestValidateExperimentalUSBIPTemplate(t *testing.T) {
+	b, err := os.ReadFile("../../templates/experimental/usb-ip.yaml")
+	assert.NilError(t, err)
+	// Only unmarshal the `usb:` subtree. Full LimaYAML.Unmarshal would
+	// trip on `base:` (custom unmarshaler) without a Read+Embed pass.
+	var y struct {
+		USB limatype.USB `yaml:"usb"`
+	}
+	assert.NilError(t, yaml.Unmarshal(b, &y))
+	assert.Assert(t, y.USB.IP.Server != nil, "template must set usb.ip.server")
+	assert.Assert(t, len(y.USB.IP.Devices) > 0, "template must declare at least one usb.ip.device")
 }

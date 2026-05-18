@@ -425,8 +425,52 @@ func Validate(y *limatype.LimaYAML, warn bool) error {
 			errs = errors.Join(errs, fmt.Errorf("field `usb.ip.server`: %w", err))
 		}
 	}
-	if len(y.USB.IP.Devices) > 0 && y.OS != nil && *y.OS != limatype.LINUX {
-		logrus.Warnf("usb.ip.devices is configured but the guest OS is %q; USB/IP auto-attach is only implemented for Linux guests, devices will be ignored", *y.OS)
+	if y.OS != nil && *y.OS != limatype.LINUX && (len(y.USB.IP.Devices) > 0 || y.USB.IP.Server != nil) {
+		// Hard error rather than a warning: silently dropping a
+		// declared device is the kind of surprise the validator is
+		// here to prevent. A server-only block is also rejected so
+		// the YAML accurately reflects what the guest can do. If a
+		// non-Linux backend grows USB/IP support, lift this check at
+		// that point.
+		errs = errors.Join(errs, fmt.Errorf("field `usb.ip`: USB/IP auto-attach is only supported for Linux guests, got %q", *y.OS))
+	}
+	// Reject duplicate (server, vid:pid) tuples. The reconciler would
+	// otherwise issue concurrent attach attempts for the same physical
+	// device on a host with multiple matching units plugged in, with
+	// undefined order — surfacing the ambiguity here is friendlier
+	// than letting the user wonder why "only one of them attached".
+	// BusID duplicates are caught the same way.
+	type key struct{ server, busid, vid, pid string }
+	seen := make(map[key]int, len(y.USB.IP.Devices))
+	for i, dev := range y.USB.IP.Devices {
+		server := ""
+		if dev.Server != nil {
+			server = *dev.Server
+		} else if y.USB.IP.Server != nil {
+			server = *y.USB.IP.Server
+		}
+		// Normalise the server to `host:port` (default 3240) so that
+		// `host.lima.internal` and `host.lima.internal:3240` are
+		// recognised as the same endpoint. Without this, the two
+		// equivalent strings hash to different keys and slip past the
+		// duplicate check.
+		server = normalizeUSBIPServer(server)
+		// VID/PID are already canonicalised to lowercase by FillDefault
+		// before Validate runs, so no further normalisation is needed
+		// at the duplicate-check site.
+		vid, pid := "", ""
+		if dev.VendorID != nil {
+			vid = *dev.VendorID
+		}
+		if dev.ProductID != nil {
+			pid = *dev.ProductID
+		}
+		k := key{server: server, busid: dev.BusID, vid: vid, pid: pid}
+		if prev, ok := seen[k]; ok {
+			errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d]`: duplicate of `usb.ip.devices[%d]` (server, busid, vendorID, productID all match)", i, prev))
+			continue
+		}
+		seen[k] = i
 	}
 
 	return errs
@@ -688,9 +732,11 @@ func validateUSBIPDevice(i int, dev *limatype.USBIPDevice) error {
 	}
 
 	if hasBusID && !usbipBusIDRe.MatchString(dev.BusID) {
-		// Reject anything outside [A-Za-z0-9.-] to catch typos and to
-		// stop shell injection through the boot-script env file.
-		errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d].busid` contains invalid character (allowed: alphanumeric, '-', '.'): %q", i, dev.BusID))
+		// Reject anything outside the Linux bus-id grammar to catch
+		// typos and to stop shell injection through the boot-script
+		// env file. The strict form is `\d+-\d+(\.\d+)*` per the
+		// kernel's USB topology naming.
+		errs = errors.Join(errs, fmt.Errorf("field `usb.ip.devices[%d].busid` is not a valid Linux bus-id (expected e.g. \"1-2\" or \"01-1.4\"): %q", i, dev.BusID))
 	}
 
 	if hasVID {
@@ -717,9 +763,27 @@ func validateUSBIPDevice(i int, dev *limatype.USBIPDevice) error {
 // re-emitted into a shell-sourced env file without further escaping.
 var (
 	usbHex4Re    = regexp.MustCompile(`^[0-9a-f]{4}$`)
-	usbipBusIDRe = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
+	usbipBusIDRe = regexp.MustCompile(`^[0-9]+-[0-9]+(\.[0-9]+)*$`)
 	usbipHostRe  = regexp.MustCompile(`^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$`)
 )
+
+// normalizeUSBIPServer returns the canonical `host:port` form of a
+// `usb.ip.*.server` value, defaulting the port to 3240 when absent.
+// Used by the duplicate-detection key so a per-device override that
+// matches the (defaulted) top-level value hashes to the same entry.
+// Inputs that aren't well-formed `host[:port]` pass through unchanged
+// — [validateUSBIPServer] will have already flagged them, and we
+// don't want to mask that with a parse here.
+func normalizeUSBIPServer(s string) string {
+	if s == "" {
+		return ""
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return net.JoinHostPort(s, "3240")
+	}
+	return net.JoinHostPort(host, port)
+}
 
 func validateUSBHex4(field, s string) error {
 	if !usbHex4Re.MatchString(s) {
