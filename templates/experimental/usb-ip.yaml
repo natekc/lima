@@ -68,3 +68,54 @@ usb:
 # After `limactl start`, verify with:
 #   limactl shell default -- lsusb
 #   limactl shell default -- sudo dmesg | tail
+#
+# ---------------------------------------------------------------------
+# Reproducing without a real USB device (synthetic server)
+# ---------------------------------------------------------------------
+#
+# You can verify the guest-side reconciler end-to-end without owning
+# the device, without root, and without installing a real USB/IP
+# daemon, by running a ~200-line mock server on the host that speaks
+# just enough of the USB/IP wire protocol for `usbip attach` to
+# return success. This is how we test this template in CI-style
+# environments.
+#
+#   1. Run the in-repo mock server (see hack/usbip-mockd/main.go)
+#      on the host:
+#
+#        go run ./hack/usbip-mockd --listen 0.0.0.0:3240
+#
+#      It advertises one synthetic device:
+#        busid = 1-1   vendorID = 0525   productID = a4a0
+#
+#   2. Configure this template's `usb.ip.devices` to match the
+#      synthetic device, e.g.:
+#
+#        usb:
+#          ip:
+#            server: host.lima.internal:3240
+#            devices:
+#            - vendorID: "0525"
+#              productID: "a4a0"
+#
+#   3. `limactl start ./usb-ip.yaml` and watch both sides:
+#
+#      host (mockd) should log, every reconcile interval:
+#        OP_REQ_DEVLIST   ... <-- reconciler polling
+#        OP_REQ_IMPORT busid="1-1"
+#        IMPORT accepted; entering URB phase (no responses)
+#
+#      guest (lima-guestagent) should log:
+#        usbip reconcile: attached 1-1 @ host.lima.internal:3240
+#
+# Notes / caveats:
+#   * The mock does not service URB traffic after IMPORT, so the
+#     kernel's vhci_hcd tears the attachment down a few seconds
+#     after each attach. The reconciler immediately re-attaches on
+#     the next poll. This is expected -- the test exercises the
+#     attach control path, not actual USB data transfer.
+#   * Therefore `lsusb` inside the guest will NOT show the
+#     synthetic device; `journalctl -u lima-guestagent` is the
+#     authoritative signal. To exercise data transfer too you need
+#     a real USB/IP server (e.g. usbipd-darwin, usbipd-mac, or
+#     Linux `usbipd`) with a real device bound.
